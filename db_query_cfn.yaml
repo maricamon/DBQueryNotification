@@ -1,0 +1,406 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cloudformation template to setup a Lambda function that queries an existing RDS database inside a VPC every n minutes.
+  
+Parameters:
+  
+  LambdaVPC:
+    Description: >
+      VPC ID of RDS database.
+    Type: AWS::EC2::VPC::Id
+
+  RouteTables:    # to be updated to receive list
+    Description: >
+      VPC Route table for S3 VPC endpoint. 
+    Type: String
+  
+  LambdaSubnet:   # to be updated to receive list
+    Description: >
+      VPC subnet ID.
+    Type: AWS::EC2::Subnet::Id
+
+  LambdaSecurityGroup:    # to be updated to receive list
+    Description: >
+      VPC security groups ID.
+    Type: AWS::EC2::SecurityGroup::Id
+
+  LambdaRate:
+    Description: >
+      The rate (frequency) that determines when CloudWatch Events runs the rule that
+      triggers the Lambda function.
+    Default: rate(1 minute)
+    AllowedValues:
+      - rate(1 minute)
+      - rate(10 minutes)
+      - rate(60 minutes)
+    Type: String
+  
+  PostgresDBInstanceId:
+    Description: >
+      RDS Postgresql instance id.
+    Type: String
+  
+  DBHost:
+    Description: >
+      Database username for RDS Postgresql. 
+    Type: String
+    Default: 'postgres'
+
+  DBPassword:
+    Description: >
+      Database password for RDS Postgresql. 
+    Type: String
+
+  EmailSender:
+    Description: >
+      Email used to send the db query notification.
+    Type: String
+
+  EmailRecipients:
+    Description: >
+      Email that will receive the db query notification.
+    Type: String
+
+  S3BucketName:
+    Description: >
+      Name of S3 bucket to store report. Leave blank to create one.
+    Default: ''
+    Type: String
+
+Conditions:
+  CreateBucket: !Equals
+    - !Ref S3BucketName
+    - ''
+    
+Resources:
+
+  ReportsBucket:
+    Type: 'AWS::S3::Bucket'
+    Condition: CreateBucket
+
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Condition: CreateBucket
+    Properties:
+      Bucket: !Ref ReportsBucket
+
+  S3GatewayEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    # Condition: CreateBucket
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:*Object'
+            Resource: '*'
+      RouteTableIds: 
+        - !Sub ${RouteTables}
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Sub ${LambdaVPC}
+      VpcEndpointType: Gateway
+
+  EmailSNSTopic: 
+    Type: AWS::SNS::Topic
+    Properties: 
+      Subscription: 
+        - Endpoint: !Sub ${EmailSender}
+          Protocol: "email"
+        - Endpoint: !Sub ${EmailRecipients}
+          Protocol: "email"
+
+  SNSInterfaceEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      VpcId: !Sub ${LambdaVPC}
+      SubnetIds: 
+        - !Sub ${LambdaSubnet}
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+
+  SecretsDBCredential:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Description: AWS RDS admin credentials
+      SecretString: !Sub '{"username": "${DBHost}", "password": "${DBPassword}"}'
+
+  SecretRDSInstanceAttachment:
+    Type: 'AWS::SecretsManager::SecretTargetAttachment'
+    Properties:
+      SecretId: !Ref SecretsDBCredential
+      TargetId: !Sub ${PostgresDBInstanceId}
+      TargetType: 'AWS::RDS::DBInstance'
+
+  SecretsInterfaceEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcId: !Sub ${LambdaVPC}
+      SubnetIds: 
+        - !Sub ${LambdaSubnet}
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+      Policies:
+        - PolicyName: GetDBCredentials
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
+                Effect: Allow  
+        - PolicyName: S3ReadWrite
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action: 
+                  - 's3:*Object'
+                Resource: !If
+                  - CreateBucket
+                  - !Join ['', [!GetAtt ReportsBucket.Arn, '/*']]
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+                Effect: Allow
+    
+
+  LambdaSchedule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: >
+        A schedule for the Lambda function..
+      ScheduleExpression: !Sub ${LambdaRate}
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: LambdaSchedule
+
+  LambdaSchedulePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt LambdaSchedule.Arn
+
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: >
+        Lambda function that queries db and sends email notif
+      Code:
+        # alternate option to Zipfile 
+        # S3Bucket: my-bucket
+        # S3Key: function.zip
+      
+        ZipFile: |
+          #!/usr/bin/python
+          import os
+          import json
+          import psycopg2
+          from psycopg2 import sql
+
+          import boto3
+          import base64
+          from botocore.exceptions import ClientError
+
+          import pandas as pd
+
+          region_name = os.environ["AWS_REGION"]
+
+          def get_db_credentials(secret_name):
+
+              # Create a Secrets Manager client
+              session = boto3.session.Session()
+              client = session.client(
+                  service_name='secretsmanager',
+                  region_name=region_name
+              )
+              
+              response = None
+              
+              try:
+                  get_secret_value_response = client.get_secret_value(
+                      SecretId=secret_name
+                  )
+              except ClientError as e:
+                  raise e
+              else:
+                  # Decrypts secret using the associated KMS key.
+                  # Depending on whether the secret is a string or binary, one of these fields will be populated.
+                  if 'SecretString' in get_secret_value_response:
+                      secret = get_secret_value_response['SecretString']
+                      response = secret
+                  else:
+                      decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+                      response = decoded_binary_secret
+                      
+              return response
+              
+          def query_db(db_credential):
+              """ Connect to the PostgreSQL database server """
+              conn = None
+              try:
+
+                  # connect to the PostgreSQL server
+                  print('Connecting to the PostgreSQL database...')
+                  conn = psycopg2.connect(
+                      host=db_credential["host"],
+                      database=db_credential["engine"],
+                      user=db_credential["username"],
+                      password=db_credential["password"])
+                  
+                  # create a cursor
+                  cur = conn.cursor()
+                  
+                  # uncomment in production, used to generate dummy table
+                  """create table"""
+                  cur.execute('CREATE TABLE people (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, fave_color VARCHAR(255) NOT NULL)')
+
+                  # uncomment in production, used to generate dummy data
+                  """insert items (2 options)"""
+                  cur.execute("""INSERT INTO people (id, name, fave_color) VALUES (%s,%s,%s)""", (1001, 'Mari', 'orange'))
+                  table_name = "people"
+                  cur.execute(
+                      sql.SQL("INSERT INTO {} VALUES (%s, %s, %s);")
+                      .format(sql.Identifier(table_name)), 
+                      [1004, "Tess", "pink"])
+                  
+                  """display items"""
+                  # print('PostgreSQL data')
+                  sql_command = 'SELECT * FROM people'
+              
+                  # option 1, result of sql command is JSON then converts it to JSON String
+                  # cur.execute(sql_command)
+                  # response = cur.fetchall() 
+                  # response = json.dumps(response)
+
+                  # option 2, result of sql command is DataFrame then converts it to Tabular String
+                  response = pd.read_sql_query(sql_command, conn)
+                  response = json.loads(json.dumps(response, default=str))
+                  
+                  # close the communication with the PostgreSQL
+                  cur.close()
+              except (Exception, psycopg2.DatabaseError) as error:
+                  response = error
+              finally:
+                  if conn is not None:
+                      conn.close()
+                      print('Database connection closed.')
+                  return response
+
+          def send_email(str_data, subject):
+              
+              """send sql email"""
+              client = boto3.client('sns')
+              snsArn = os.environ["dbReportTopic"]
+              message = str_data
+              
+              response = client.publish(
+                  TopicArn = snsArn,
+                  Message = message,
+                  Subject=subject
+              )
+              
+              return response
+                  
+          def save_to_bucket(df_data, filename):
+              
+              s3 = boto3.resource('s3')
+              
+              bucket_name = os.environ["bucketName"]
+              bucket = s3.Bucket(bucket_name)
+              
+              tempfile = '/tmp/' + filename
+              df_data.to_csv(tempfile)
+              
+              """upload the data to s3"""
+              response = bucket.upload_file(tempfile, filename)
+              
+              return response
+              
+          def lambda_handler(event, context):
+              
+              dbCredential = os.environ["dbCredentials"]
+              db_credential = json.loads(get_db_credentials(secret_name=dbCredential))
+              
+              db_response = query_db(db_credential) 
+              
+              save_to_bucket(
+                  df_data = db_response,
+                  filename = 'dbq.txt')
+                  
+              send_email_response = send_email(
+                  str_data = db_response,
+                  subject="DB Query"
+                  )
+                  
+              return send_email_response
+      Environment:
+        Variables:
+          dbCredentials: !Ref SecretsDBCredential
+          dbReportTopic: !Ref EmailSNSTopic
+          emailSender: !Sub ${EmailSender}
+          emailRecipients: !Sub ${EmailRecipients}
+          bucketName: !If
+              - CreateBucket
+              - !Ref ReportsBucket
+              - !Sub ${S3BucketName}
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.7
+      VpcConfig:
+        SecurityGroupIds: 
+          - !Sub ${LambdaSecurityGroup}
+        SubnetIds: 
+          - !Sub ${LambdaSubnet}
+
+Outputs: 
+  S3BucketArn: 
+    Description: Arn of Created S3 Bucket
+    Value: !If
+      - CreateBucket
+      - !Ref ReportsBucket
+      - !Sub 'arn:aws:s3:::${S3BucketName}'
+  SNSTopicArn:
+    Description: Arn of Created SNS Topic
+    Value: !Ref EmailSNSTopic
+  SecretsArn:
+    Description: Arn of Created Secrets
+    Value: !Ref SecretsDBCredential
+  LambdaArn:
+    Description: Arn of Created Lambda Function
+    Value: !Ref LambdaFunction
